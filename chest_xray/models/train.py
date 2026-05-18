@@ -4,40 +4,8 @@ from torch.utils.data import DataLoader
 from torchvision import transforms
 from tqdm import tqdm
 from pathlib import Path
-
 from chest_xray.data.chestdataset import ChestXRayDataset
-
-# the path the CSV file and to the images
-
-
-# The 15 output labels of the model
-classes = (
-    "Hernia",
-    "Pneumonia",
-    "Fibrosis",
-    "Effusion",
-    "Edema",
-    "Emphysema",
-    "Mass",
-    "Nodule",
-    "Atelectasis",
-    "Cardiomegaly",
-    "Infiltration",
-    "Pleural_Thickening",
-    "Consolidation",
-    "Pneumothorax",
-    "No Finding",
-)
-
-# Hyperparameters
-batch_size = 16
-num_epochs = 30
-head_epochs = 5
-head_lr = 1e-3
-fine_tune_lr = 1e-4
-image_size = 512
-seed = 42
-
+from chest_xray.data.labels import CLASSES
 
 class ModelTrainer:
     def __init__(self, model, criterion, optimizer, device):
@@ -45,25 +13,29 @@ class ModelTrainer:
         self.criterion = criterion
         self.optimizer = optimizer
         self.device = device
+        self.root = Path(__file__).parent.parent.parent
+        self.image_root = self.root / "data" / "images"
+        self.classes = CLASSES
+        self.batch_size = 16
+        self.image_size = 512
+        self.seed = 42
         
-    def load_csv(self, csv_file):
-        Root = Path(__file__).parent.parent
-        csv_file = Root / "data" / "lists" / "Data_Entry_2017.csv"
-        image_root = Root / "data" / "images"
+    def load_csv(self):
+        csv_file = self.root / "data" / "lists" / "Data_Entry_2017.csv"
         return pd.read_csv(csv_file)
     
     def transform_images(self, image_size):
         return transforms.Compose([
             transforms.Resize((image_size, image_size)),
-            transforms.Grayscale(num_output_channels=1),  # Convert to grayscale 
+            transforms.Grayscale(num_output_channels=3),  # Convert to grayscale 
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.449], std=[0.226]),
         ])
         
-    def create_dataloaders(self, df, image_root, classes, transform):
-        unique_patients = df["Patient ID"].unique()
+    def create_dataloaders(self, data, image_root, classes, transform):
+        unique_patients = data["Patient ID"].unique()
         
-        generator = torch.Generator().manual_seed(seed)
+        generator = torch.Generator().manual_seed(self.seed)
         perm = torch.randperm(len(unique_patients), generator=generator)
         
         unique_patients = unique_patients[perm.numpy()]
@@ -72,30 +44,30 @@ class ModelTrainer:
         train_patients = set(unique_patients[:train_patient_count])
         val_patients = set(unique_patients[train_patient_count:])
         
-        train_df = df[df["Patient ID"].isin(train_patients)].reset_index(drop=True)
-        val_df = df[df["Patient ID"].isin(val_patients)].reset_index(drop=True)
+        train_data = data[data["Patient ID"].isin(train_patients)].reset_index(drop=True)
+        val_data = data[data["Patient ID"].isin(val_patients)].reset_index(drop=True)
         
-        train_dataset = ChestXRayDataset(train_df, image_root, classes, transform)
-        val_dataset = ChestXRayDataset(val_df, image_root, classes, transform)
+        train_dataset = ChestXRayDataset(train_data, image_root, classes, transform)
+        val_dataset = ChestXRayDataset(val_data, image_root, classes, transform)
         
         train_loader = DataLoader(
             train_dataset,
-            batch_size=batch_size,
+            batch_size=self.batch_size,
             shuffle=True,
             num_workers=0,
             pin_memory=torch.cuda.is_available(),
         )
         val_loader = DataLoader(
             val_dataset,
-            batch_size=batch_size,
+            batch_size=self.batch_size,
             shuffle=False,
             num_workers=0,
             pin_memory=torch.cuda.is_available(),
         )
         return train_loader, val_loader
 
-    def train_one_epoch(self, model, dataloader, criterion, optimizer, device, epoch, num_epochs, phase):
-        model.train()
+    def train_one_epoch(self, epoch, num_epochs, phase, dataloader):
+        self.model.train()
 
         running_loss = 0.0
 
@@ -108,16 +80,16 @@ class ModelTrainer:
         )
 
         for batch_idx, (images, labels) in enumerate(progress_bar, start=1):
-            images = images.to(device, non_blocking=True)
-            labels = labels.to(device, non_blocking=True)
+            images = images.to(self.device, non_blocking=True)
+            labels = labels.to(self.device, non_blocking=True)
 
-            optimizer.zero_grad()
+            self.optimizer.zero_grad()
 
-            outputs = model(images)
-            loss = criterion(outputs, labels)
+            outputs = self.model(images)
+            loss = self.criterion(outputs, labels)
 
             loss.backward()
-            optimizer.step()
+            self.optimizer.step()
 
             running_loss += loss.item()
             average_loss = running_loss / batch_idx
@@ -127,8 +99,8 @@ class ModelTrainer:
         return running_loss / len(dataloader)
 
 
-    def validate_one_epoch(self, model, dataloader, criterion, device, epoch, num_epochs, phase):
-        model.eval()
+    def validate_one_epoch(self, epoch, num_epochs, phase, dataloader):
+        self.model.eval()
 
         running_loss = 0.0
 
@@ -142,11 +114,11 @@ class ModelTrainer:
 
         with torch.no_grad():
             for batch_idx, (images, labels) in enumerate(progress_bar, start=1):
-                images = images.to(device, non_blocking=True)
-                labels = labels.to(device, non_blocking=True)
+                images = images.to(self.device, non_blocking=True)
+                labels = labels.to(self.device, non_blocking=True)
 
-                outputs = model(images)
-                loss = criterion(outputs, labels)
+                outputs = self.model(images)
+                loss = self.criterion(outputs, labels)
 
                 running_loss += loss.item()
                 average_loss = running_loss / batch_idx
@@ -154,3 +126,15 @@ class ModelTrainer:
                 progress_bar.set_postfix(loss=f"{average_loss:.4f}")
 
         return running_loss / len(dataloader)
+    
+    def load_data(self):
+        data = self.load_csv()
+        transform = self.transform_images(self.image_size)
+        train_loader, val_loader = self.create_dataloaders(data, self.image_root, self.classes, transform)
+        return train_loader, val_loader
+
+    def train(self, num_epochs, train_loader, val_loader):
+        for epoch in range(num_epochs):
+            train_loss = self.train_one_epoch(epoch, num_epochs, "Phase 1", train_loader)
+            val_loss = self.validate_one_epoch(epoch, num_epochs, "Phase 1", val_loader)
+            print(f"Epoch [{epoch + 1}/{num_epochs}] Phase 1 Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
